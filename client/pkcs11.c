@@ -52,6 +52,7 @@ typedef struct PKCS11Private PKCS11Private;
 struct PKCS11Token {
     Token base;
     PKCS11_SLOT *slot;
+    PKCS11_CERT *cert;
     PKCS11_CERT *certs;
     unsigned int ncerts;
 };
@@ -89,7 +90,7 @@ static X509 *findCert(const PKCS11Token *token,
 static TokenError _backend_getBase64Chain(const PKCS11Token *token,
                                           char ***certs, size_t *count) {
     
-    X509 *cert = token->certs[0].x509;
+    X509 *cert = token->cert[0].x509;
     if (!cert) {
         return TokenError_Unknown;
     }
@@ -133,7 +134,7 @@ static TokenError _backend_sign(PKCS11Token *token,
     }
 
     // Find the key for the token
-    PKCS11_CERT *cert = &token->certs[0];
+    PKCS11_CERT *cert = token->cert;
     PKCS11_KEY *key = PKCS11_find_key(cert);
 
     if (!key) return TokenError_BadPin;
@@ -159,40 +160,46 @@ static TokenError _backend_sign(PKCS11Token *token,
  */
 static void pkcs11_found_token(Backend *backend, PKCS11_SLOT *slot) {
     int rc;
-    
-    PKCS11Token *token = calloc(1, sizeof(PKCS11Token));
-    if (!token) return;
-
-    token->slot = slot;
 
     // Scan card
-    rc = PKCS11_enumerate_certs(slot->token, &token->certs, &token->ncerts);
-    if (rc || token->ncerts == 0)
-        goto fail;
-
-    // Firts cert in the chain is the user cert. Rest is associated authority certs
-    X509 *x = token->certs[0].x509;
-    X509_NAME *id = X509_get_subject_name(x);
-
-    if (!certutil_hasKeyUsage(x, backend->notifier->keyUsage))
-        goto fail;
-
-    if (!certutil_matchSubjectFilter(backend->notifier->subjectFilter, id))
-        goto fail;
-
-    token->base.backend = backend;
-    if (slot->token->secureLogin == 0) {
-        token->base.status = TokenStatus_NeedPassword;
-    } else {
-        token->base.status = TokenStatus_NeedPIN;
+    unsigned int ncerts = 0;
+    PKCS11_CERT *certs;
+    rc = PKCS11_enumerate_certs(slot->token, &certs, &ncerts);
+    if (rc || ncerts == 0) {
+        fprintf(stderr, BINNAME ": found no certificates in slot\n");
+        return;
     }
-    token->base.displayName = certutil_getDisplayNameFromDN(id);
-    token->base.tag = slot->token->label;
-    backend->notifier->notifyFunction(&token->base, TokenChange_Added);
-    return;
 
-fail:
-    backend->freeToken(token);
+    for (unsigned int i = 0; i < ncerts; i++) {
+        // Check if this certificate is a BankID and has the right key usage
+        X509 *x = certs[i].x509;
+        X509_NAME *id = X509_get_subject_name(x);
+
+        if (!certutil_hasKeyUsage(x, backend->notifier->keyUsage))
+        continue;
+
+        if (!certutil_matchSubjectFilter(backend->notifier->subjectFilter, id))
+        continue;
+
+        PKCS11Token *token = calloc(1, sizeof(PKCS11Token));
+        if (!token) return;
+
+        token->slot = slot;
+        token->cert = &certs[i];
+        token->certs = certs;
+        token->ncerts = ncerts;
+
+        token->base.backend = backend;
+        if (slot->token->secureLogin == 0) {
+            token->base.status = TokenStatus_NeedPassword;
+        } else {
+            token->base.status = TokenStatus_NeedPIN;
+        }
+        token->base.displayName = certutil_getDisplayNameFromDN(id);
+        token->base.tag = slot->token->label;
+        backend->notifier->notifyFunction(&token->base, TokenChange_Added);
+     }
+
 }
 
 /**
